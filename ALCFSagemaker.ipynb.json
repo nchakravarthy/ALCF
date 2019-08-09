@@ -1,0 +1,869 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Queue Prediction"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Parsl (Parallel Scripting in Python) lets python functions or external applications run at the same time but does not really an intelligent way to manage resources. This includes provisioning new resources, knowing when to scale up or down, or releasing unnecessary resources at a certain point. It is expensive to grab new resources from an HPC platform as they are heavily used and you can end up sitting in queue for hours, resulting in us wanting to add intelligence to Parsl's resource management strategies. This notebook aims to accurately predict the queue time of a request that has been sent to the supercomputer using 2 different methods: Amazon Sagemaker and KFold, all tested on 2019 time series data. We hope this will be comparable to the QBETS model by Rich Wolski which is already in use and gives u a confidence interval of getting a certain amount of nodes in a certain amount of minutes."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### Amazon Sagemaker"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "##### Importing Libraries and Creating IAM Role"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Success - the MySageMakerInstance is in the us-east-1 region. You will use the 811284229777.dkr.ecr.us-east-1.amazonaws.com/xgboost:latest container for your SageMaker endpoint.\n"
+     ]
+    }
+   ],
+   "source": [
+    "# import libraries\n",
+    "import boto3, re, sys, math, json, os, sagemaker, urllib.request\n",
+    "from sagemaker import get_execution_role\n",
+    "import numpy as np                                \n",
+    "import pandas as pd                               \n",
+    "import matplotlib.pyplot as plt                   \n",
+    "from IPython.display import Image                 \n",
+    "from IPython.display import display               \n",
+    "from time import gmtime, strftime                 \n",
+    "from sagemaker.predictor import csv_serializer   \n",
+    "from sklearn.model_selection import KFold\n",
+    "from sklearn.preprocessing import MinMaxScaler\n",
+    "from sklearn.svm import SVR\n",
+    "from sklearn.model_selection import cross_val_score, cross_val_predict\n",
+    "\n",
+    "role = get_execution_role()\n",
+    "prefix = 'sagemaker/DEMO-xgboost-dm'\n",
+    "containers = {'us-west-2': '433757028032.dkr.ecr.us-west-2.amazonaws.com/xgboost:latest',\n",
+    "              'us-east-1': '811284229777.dkr.ecr.us-east-1.amazonaws.com/xgboost:latest',\n",
+    "              'us-east-2': '825641698319.dkr.ecr.us-east-2.amazonaws.com/xgboost:latest',\n",
+    "              'eu-west-1': '685385470294.dkr.ecr.eu-west-1.amazonaws.com/xgboost:latest'}\n",
+    "my_region = boto3.session.Session().region_name\n",
+    "print(\"Success - the MySageMakerInstance is in the \" + my_region + \" region. You will use the \" + containers[my_region] + \" container for your SageMaker endpoint.\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "##### Creating a S3 Bucket to Store Data"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "metadata": {
+    "scrolled": true
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "S3 bucket created successfully\n"
+     ]
+    }
+   ],
+   "source": [
+    "bucket_name = 'alcfsagemakerbucket'\n",
+    "s3 = boto3.resource('s3')\n",
+    "try:\n",
+    "    if  my_region == 'us-east-1':\n",
+    "      s3.create_bucket(Bucket=bucket_name)\n",
+    "    else: \n",
+    "      s3.create_bucket(Bucket=bucket_name, CreateBucketConfiguration={ 'LocationConstraint': my_region })\n",
+    "    print('S3 bucket created successfully')\n",
+    "except Exception as e:\n",
+    "    print('S3 error: ',e)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "##### Downloading Data to Sagemaker Instance"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {
+    "scrolled": false
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Success: Data loaded into dataframe.\n"
+     ]
+    }
+   ],
+   "source": [
+    "try:\n",
+    "  model_data = pd.read_csv('./ANL-ALCF-DJC-THETA_20190101_20190630.csv', header=0)\n",
+    "  print('Success: Data loaded into dataframe.')\n",
+    "except Exception as e:\n",
+    "    print('Data load error: ',e)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "##### Pre-Splitting the Data"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "In order to run this model it is essential to split that dataset into train and test data. For this example, I used a 70-30 split. Instead of using pandas split the csv file, I decided to pre-split because time series data should not be randomized. The first 70% of the data is the trainset and the last 30% of the data is the testset."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "train_data = pd.read_csv('70_ANL-ALCF-DJC-THETA_20190101_20190630-2-2-2-2.csv', header=0)\n",
+    "test_data = pd.read_csv('30_ANL-ALCF-DJC-THETA_20190101_20190630.csv', header=0)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "##### Reformatting Data to use XGBoost model"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Using XGBoost has some restrictions, such as having your dependent variable be the first column as well as no header being in the dataset. Along with this, all of the columns must be either integers or floats. Thus, all the string type columns were taken out, still proving to be useful as the important features are run time, nodes requested, nodes used, etc., all being floats. Additionally, the dependent variable (queue time) must be [0, 1], otherwise XGBoost does not run. Thus, all the queue times that were below 1000 were assigned to 0 and the times above were assigned 1s."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "pd.concat([train_data['QUEUED_WAIT_SECONDS'], train_data.drop(['QUEUED_WAIT_SECONDS'], axis=1)], axis=1).to_csv('train.csv', index=False, header=False)\n",
+    "boto3.Session().resource('s3').Bucket(bucket_name).Object(os.path.join(prefix, 'train/train.csv')).upload_file('train.csv')\n",
+    "s3_input_train = sagemaker.s3_input(s3_data='s3://{}/{}/train'.format(bucket_name, prefix), content_type='csv')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "sess = sagemaker.Session()\n",
+    "xgb = sagemaker.estimator.Estimator(containers[my_region],role, train_instance_count=1, train_instance_type='ml.m4.xlarge',output_path='s3://{}/{}/output'.format(bucket_name, prefix),sagemaker_session=sess)\n",
+    "xgb.set_hyperparameters(max_depth=5,eta=0.2,gamma=4,min_child_weight=6,subsample=0.8,silent=0,objective='binary:logistic',num_round=100)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "##### Train the Model using Gradient Optimization"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "2019-08-08 20:48:27 Starting - Starting the training job...\n",
+      "2019-08-08 20:48:29 Starting - Launching requested ML instances......\n",
+      "2019-08-08 20:49:33 Starting - Preparing the instances for training......\n",
+      "2019-08-08 20:50:55 Downloading - Downloading input data\n",
+      "2019-08-08 20:50:55 Training - Downloading the training image...\n",
+      "2019-08-08 20:51:25 Uploading - Uploading generated training model\n",
+      "2019-08-08 20:51:25 Completed - Training job completed\n",
+      "\n",
+      "\u001b[31mArguments: train\u001b[0m\n",
+      "\u001b[31m[2019-08-08:20:51:13:INFO] Running standalone xgboost training.\u001b[0m\n",
+      "\u001b[31m[2019-08-08:20:51:13:INFO] Path /opt/ml/input/data/validation does not exist!\u001b[0m\n",
+      "\u001b[31m[2019-08-08:20:51:13:INFO] File size need to be processed in the node: 6.88mb. Available memory size in the node: 8587.93mb\u001b[0m\n",
+      "\u001b[31m[2019-08-08:20:51:13:INFO] Determined delimiter of CSV input is ','\u001b[0m\n",
+      "\u001b[31m[20:51:13] S3DistributionType set as FullyReplicated\u001b[0m\n",
+      "\u001b[31m[20:51:13] 34049x43 matrix with 1464107 entries loaded from /opt/ml/input/data/train?format=csv&label_column=0&delimiter=,\u001b[0m\n",
+      "\u001b[31m[20:51:13] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 20 extra nodes, 6 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[0]#011train-error:0.009428\u001b[0m\n",
+      "\u001b[31m[20:51:13] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 22 extra nodes, 6 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[1]#011train-error:0.008429\u001b[0m\n",
+      "\u001b[31m[20:51:13] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 24 extra nodes, 0 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[2]#011train-error:0.008987\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 20 extra nodes, 8 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[3]#011train-error:0.007988\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 18 extra nodes, 10 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[4]#011train-error:0.008018\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 18 extra nodes, 0 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[5]#011train-error:0.007724\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 18 extra nodes, 2 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[6]#011train-error:0.007665\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 22 extra nodes, 2 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[7]#011train-error:0.007754\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 20 extra nodes, 4 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[8]#011train-error:0.007754\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 18 extra nodes, 2 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[9]#011train-error:0.007812\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 16 extra nodes, 6 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[10]#011train-error:0.008047\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 24 extra nodes, 6 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[11]#011train-error:0.007988\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 12 extra nodes, 6 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[12]#011train-error:0.00793\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 16 extra nodes, 4 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[13]#011train-error:0.007665\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 12 extra nodes, 4 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[14]#011train-error:0.007636\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 18 extra nodes, 0 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[15]#011train-error:0.007372\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 10 extra nodes, 6 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[16]#011train-error:0.007313\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 14 extra nodes, 2 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[17]#011train-error:0.007372\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 10 extra nodes, 2 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[18]#011train-error:0.007254\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 12 extra nodes, 2 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[19]#011train-error:0.007107\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 14 extra nodes, 2 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[20]#011train-error:0.006961\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 12 extra nodes, 2 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[21]#011train-error:0.006843\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 12 extra nodes, 2 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[22]#011train-error:0.006814\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 10 extra nodes, 0 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[23]#011train-error:0.006726\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 12 extra nodes, 2 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[24]#011train-error:0.006784\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 14 extra nodes, 4 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[25]#011train-error:0.006696\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 12 extra nodes, 0 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[26]#011train-error:0.006637\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 10 extra nodes, 2 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[27]#011train-error:0.006667\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 10 extra nodes, 4 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[28]#011train-error:0.006667\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 10 extra nodes, 2 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[29]#011train-error:0.006696\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 16 extra nodes, 4 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[30]#011train-error:0.006872\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 16 extra nodes, 2 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[31]#011train-error:0.00652\u001b[0m\n",
+      "\u001b[31m[20:51:14] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 12 extra nodes, 0 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[32]#011train-error:0.006461\u001b[0m\n",
+      "\u001b[31m[20:51:15] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 10 extra nodes, 2 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[33]#011train-error:0.006403\u001b[0m\n",
+      "\u001b[31m[20:51:15] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 4 extra nodes, 8 pruned nodes, max_depth=2\u001b[0m\n",
+      "\u001b[31m[34]#011train-error:0.006403\u001b[0m\n",
+      "\u001b[31m[20:51:15] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 14 extra nodes, 2 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[35]#011train-error:0.006314\u001b[0m\n",
+      "\u001b[31m[20:51:15] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 22 extra nodes, 4 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[36]#011train-error:0.006256\u001b[0m\n",
+      "\u001b[31m[20:51:15] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 12 extra nodes, 0 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[37]#011train-error:0.006285\u001b[0m\n",
+      "\u001b[31m[20:51:15] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 12 extra nodes, 2 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[38]#011train-error:0.006285\u001b[0m\n",
+      "\u001b[31m[20:51:15] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 10 extra nodes, 6 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[39]#011train-error:0.006285\u001b[0m\n",
+      "\u001b[31m[20:51:15] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 16 extra nodes, 4 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[40]#011train-error:0.006256\u001b[0m\n",
+      "\u001b[31m[20:51:15] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 24 extra nodes, 4 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[41]#011train-error:0.005933\u001b[0m\n",
+      "\u001b[31m[20:51:15] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 22 extra nodes, 4 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[42]#011train-error:0.005845\u001b[0m\n",
+      "\u001b[31m[20:51:15] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 12 extra nodes, 2 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[43]#011train-error:0.005815\u001b[0m\n",
+      "\u001b[31m[20:51:15] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 12 extra nodes, 2 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[44]#011train-error:0.005756\u001b[0m\n",
+      "\u001b[31m[20:51:15] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 20 extra nodes, 8 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[45]#011train-error:0.005463\u001b[0m\n",
+      "\u001b[31m[20:51:15] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 18 extra nodes, 4 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[46]#011train-error:0.005463\u001b[0m\n",
+      "\u001b[31m[20:51:15] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 16 extra nodes, 6 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[47]#011train-error:0.005375\u001b[0m\n",
+      "\u001b[31m[20:51:15] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 0 extra nodes, 14 pruned nodes, max_depth=0\u001b[0m\n",
+      "\u001b[31m[48]#011train-error:0.005375\u001b[0m\n",
+      "\u001b[31m[20:51:15] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 18 extra nodes, 0 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[49]#011train-error:0.005228\u001b[0m\n",
+      "\u001b[31m[20:51:15] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 2 extra nodes, 10 pruned nodes, max_depth=1\u001b[0m\n",
+      "\u001b[31m[50]#011train-error:0.005228\u001b[0m\n",
+      "\u001b[31m[20:51:15] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 0 extra nodes, 16 pruned nodes, max_depth=0\u001b[0m\n",
+      "\u001b[31m[51]#011train-error:0.005228\u001b[0m\n",
+      "\u001b[31m[20:51:15] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 12 extra nodes, 14 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[52]#011train-error:0.005169\u001b[0m\n",
+      "\u001b[31m[20:51:15] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 14 extra nodes, 2 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[53]#011train-error:0.00514\u001b[0m\n",
+      "\u001b[31m[20:51:15] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 12 extra nodes, 6 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[54]#011train-error:0.004993\u001b[0m\n",
+      "\u001b[31m[20:51:16] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 14 extra nodes, 8 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[55]#011train-error:0.004963\u001b[0m\n",
+      "\u001b[31m[20:51:16] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 12 extra nodes, 8 pruned nodes, max_depth=4\u001b[0m\n",
+      "\u001b[31m[56]#011train-error:0.004875\u001b[0m\n",
+      "\u001b[31m[20:51:16] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 12 extra nodes, 4 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[57]#011train-error:0.004846\u001b[0m\n",
+      "\u001b[31m[20:51:16] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 0 extra nodes, 12 pruned nodes, max_depth=0\u001b[0m\n",
+      "\u001b[31m[58]#011train-error:0.004846\u001b[0m\n",
+      "\u001b[31m[20:51:16] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 12 extra nodes, 8 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[59]#011train-error:0.004993\u001b[0m\n",
+      "\u001b[31m[20:51:16] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 12 extra nodes, 6 pruned nodes, max_depth=4\u001b[0m\n",
+      "\u001b[31m[60]#011train-error:0.005052\u001b[0m\n",
+      "\u001b[31m[20:51:16] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 0 extra nodes, 18 pruned nodes, max_depth=0\u001b[0m\n",
+      "\u001b[31m[61]#011train-error:0.005022\u001b[0m\n",
+      "\u001b[31m[20:51:16] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 0 extra nodes, 14 pruned nodes, max_depth=0\u001b[0m\n",
+      "\u001b[31m[62]#011train-error:0.004993\u001b[0m\n",
+      "\u001b[31m[20:51:16] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 12 extra nodes, 10 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[63]#011train-error:0.004817\u001b[0m\n",
+      "\u001b[31m[20:51:16] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 0 extra nodes, 10 pruned nodes, max_depth=0\u001b[0m\n",
+      "\u001b[31m[64]#011train-error:0.004846\u001b[0m\n",
+      "\u001b[31m[20:51:16] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 0 extra nodes, 12 pruned nodes, max_depth=0\u001b[0m\n",
+      "\u001b[31m[65]#011train-error:0.004846\u001b[0m\n",
+      "\u001b[31m[20:51:16] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 6 extra nodes, 14 pruned nodes, max_depth=3\u001b[0m\n",
+      "\u001b[31m[66]#011train-error:0.004817\u001b[0m\n",
+      "\u001b[31m[20:51:16] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 0 extra nodes, 10 pruned nodes, max_depth=0\u001b[0m\n",
+      "\u001b[31m[67]#011train-error:0.004817\u001b[0m\n",
+      "\u001b[31m[20:51:16] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 6 extra nodes, 10 pruned nodes, max_depth=3\u001b[0m\n",
+      "\u001b[31m[68]#011train-error:0.004817\u001b[0m\n",
+      "\u001b[31m[20:51:16] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 0 extra nodes, 18 pruned nodes, max_depth=0\u001b[0m\n",
+      "\u001b[31m[69]#011train-error:0.004817\u001b[0m\n",
+      "\u001b[31m[20:51:16] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 14 extra nodes, 2 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[70]#011train-error:0.00464\u001b[0m\n",
+      "\u001b[31m[20:51:16] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 4 extra nodes, 12 pruned nodes, max_depth=2\u001b[0m\n",
+      "\u001b[31m[71]#011train-error:0.004611\u001b[0m\n",
+      "\u001b[31m[20:51:16] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 14 extra nodes, 0 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[72]#011train-error:0.004523\u001b[0m\n",
+      "\u001b[31m[20:51:16] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 0 extra nodes, 16 pruned nodes, max_depth=0\u001b[0m\n",
+      "\u001b[31m[73]#011train-error:0.004523\u001b[0m\n",
+      "\u001b[31m[20:51:16] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 0 extra nodes, 14 pruned nodes, max_depth=0\u001b[0m\n",
+      "\u001b[31m[74]#011train-error:0.004523\u001b[0m\n",
+      "\u001b[31m[20:51:16] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 0 extra nodes, 14 pruned nodes, max_depth=0\u001b[0m\n",
+      "\u001b[31m[75]#011train-error:0.004523\u001b[0m\n",
+      "\u001b[31m[20:51:16] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 0 extra nodes, 14 pruned nodes, max_depth=0\u001b[0m\n",
+      "\u001b[31m[76]#011train-error:0.004523\u001b[0m\n",
+      "\u001b[31m[20:51:16] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 0 extra nodes, 16 pruned nodes, max_depth=0\u001b[0m\n",
+      "\u001b[31m[77]#011train-error:0.004523\u001b[0m\n",
+      "\u001b[31m[20:51:16] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 14 extra nodes, 6 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[78]#011train-error:0.00464\u001b[0m\n",
+      "\u001b[31m[20:51:16] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 0 extra nodes, 16 pruned nodes, max_depth=0\u001b[0m\n",
+      "\u001b[31m[79]#011train-error:0.00464\u001b[0m\n",
+      "\u001b[31m[20:51:17] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 0 extra nodes, 14 pruned nodes, max_depth=0\u001b[0m\n",
+      "\u001b[31m[80]#011train-error:0.004611\u001b[0m\n",
+      "\u001b[31m[20:51:17] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 0 extra nodes, 14 pruned nodes, max_depth=0\u001b[0m\n",
+      "\u001b[31m[81]#011train-error:0.004611\u001b[0m\n",
+      "\u001b[31m[20:51:17] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 10 extra nodes, 0 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[82]#011train-error:0.00464\u001b[0m\n",
+      "\u001b[31m[20:51:17] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 0 extra nodes, 10 pruned nodes, max_depth=0\u001b[0m\n",
+      "\u001b[31m[83]#011train-error:0.00464\u001b[0m\n",
+      "\u001b[31m[20:51:17] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 10 extra nodes, 2 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[84]#011train-error:0.004611\u001b[0m\n",
+      "\u001b[31m[20:51:17] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 10 extra nodes, 4 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[85]#011train-error:0.004552\u001b[0m\n",
+      "\u001b[31m[20:51:17] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 8 extra nodes, 6 pruned nodes, max_depth=4\u001b[0m\n",
+      "\u001b[31m[86]#011train-error:0.004494\u001b[0m\n",
+      "\u001b[31m[20:51:17] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 8 extra nodes, 10 pruned nodes, max_depth=4\u001b[0m\n",
+      "\u001b[31m[87]#011train-error:0.004494\u001b[0m\n",
+      "\u001b[31m[20:51:17] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 10 extra nodes, 8 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[88]#011train-error:0.004405\u001b[0m\n",
+      "\u001b[31m[20:51:17] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 0 extra nodes, 16 pruned nodes, max_depth=0\u001b[0m\n",
+      "\u001b[31m[89]#011train-error:0.004376\u001b[0m\n",
+      "\u001b[31m[20:51:17] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 0 extra nodes, 12 pruned nodes, max_depth=0\u001b[0m\n",
+      "\u001b[31m[90]#011train-error:0.004347\u001b[0m\n",
+      "\u001b[31m[20:51:17] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 0 extra nodes, 22 pruned nodes, max_depth=0\u001b[0m\n",
+      "\u001b[31m[91]#011train-error:0.004376\u001b[0m\n",
+      "\u001b[31m[20:51:17] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 10 extra nodes, 18 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[92]#011train-error:0.004229\u001b[0m\n",
+      "\u001b[31m[20:51:17] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 0 extra nodes, 24 pruned nodes, max_depth=0\u001b[0m\n",
+      "\u001b[31m[93]#011train-error:0.004229\u001b[0m\n",
+      "\u001b[31m[20:51:17] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 8 extra nodes, 8 pruned nodes, max_depth=4\u001b[0m\n",
+      "\u001b[31m[94]#011train-error:0.0042\u001b[0m\n",
+      "\u001b[31m[20:51:17] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 8 extra nodes, 12 pruned nodes, max_depth=4\u001b[0m\n",
+      "\u001b[31m[95]#011train-error:0.004229\u001b[0m\n",
+      "\u001b[31m[20:51:17] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 10 extra nodes, 10 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[96]#011train-error:0.00417\u001b[0m\n",
+      "\u001b[31m[20:51:17] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 8 extra nodes, 8 pruned nodes, max_depth=4\u001b[0m\n",
+      "\u001b[31m[97]#011train-error:0.004141\u001b[0m\n",
+      "\u001b[31m[20:51:17] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 8 extra nodes, 8 pruned nodes, max_depth=4\u001b[0m\n",
+      "\u001b[31m[98]#011train-error:0.004288\u001b[0m\n",
+      "\u001b[31m[20:51:17] src/tree/updater_prune.cc:74: tree pruning end, 1 roots, 14 extra nodes, 6 pruned nodes, max_depth=5\u001b[0m\n",
+      "\u001b[31m[99]#011train-error:0.003965\u001b[0m\n",
+      "Billable seconds: 51\n"
+     ]
+    }
+   ],
+   "source": [
+    "xgb.fit({'train': s3_input_train})"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "##### Deploy the Model"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Deploying the model requires many resources, and currently the resource limit happens to be exceeded with the ml.m4.xlarge instance type. After contacting AWS Support, they are approving my limit increase request and are collaborating with the service team to get approval."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "metadata": {
+    "scrolled": true
+   },
+   "outputs": [
+    {
+     "ename": "ResourceLimitExceeded",
+     "evalue": "An error occurred (ResourceLimitExceeded) when calling the CreateEndpoint operation: The account-level service limit 'ml.m4.xlarge for endpoint usage' is 0 Instances, with current utilization of 0 Instances and a request delta of 1 Instances. Please contact AWS support to request an increase for this limit.",
+     "output_type": "error",
+     "traceback": [
+      "\u001b[0;31m---------------------------------------------------------------------------\u001b[0m",
+      "\u001b[0;31mResourceLimitExceeded\u001b[0m                     Traceback (most recent call last)",
+      "\u001b[0;32m<ipython-input-8-ecdb827f43a2>\u001b[0m in \u001b[0;36m<module>\u001b[0;34m()\u001b[0m\n\u001b[0;32m----> 1\u001b[0;31m \u001b[0mxgb_predictor\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mxgb\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mdeploy\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0minitial_instance_count\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0;36m1\u001b[0m\u001b[0;34m,\u001b[0m\u001b[0minstance_type\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0;34m'ml.m4.xlarge'\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m",
+      "\u001b[0;32m~/anaconda3/envs/python3/lib/python3.6/site-packages/sagemaker/estimator.py\u001b[0m in \u001b[0;36mdeploy\u001b[0;34m(self, initial_instance_count, instance_type, accelerator_type, endpoint_name, use_compiled_model, update_endpoint, wait, **kwargs)\u001b[0m\n\u001b[1;32m    384\u001b[0m             \u001b[0mupdate_endpoint\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0mupdate_endpoint\u001b[0m\u001b[0;34m,\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    385\u001b[0m             \u001b[0mtags\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0mself\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mtags\u001b[0m\u001b[0;34m,\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0;32m--> 386\u001b[0;31m             wait=wait)\n\u001b[0m\u001b[1;32m    387\u001b[0m \u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    388\u001b[0m     \u001b[0;34m@\u001b[0m\u001b[0mproperty\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;32m~/anaconda3/envs/python3/lib/python3.6/site-packages/sagemaker/model.py\u001b[0m in \u001b[0;36mdeploy\u001b[0;34m(self, initial_instance_count, instance_type, accelerator_type, endpoint_name, update_endpoint, tags, kms_key, wait)\u001b[0m\n\u001b[1;32m    301\u001b[0m         \u001b[0;32melse\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    302\u001b[0m             self.sagemaker_session.endpoint_from_production_variants(self.endpoint_name, [production_variant],\n\u001b[0;32m--> 303\u001b[0;31m                                                                      tags, kms_key, wait)\n\u001b[0m\u001b[1;32m    304\u001b[0m \u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    305\u001b[0m         \u001b[0;32mif\u001b[0m \u001b[0mself\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mpredictor_cls\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;32m~/anaconda3/envs/python3/lib/python3.6/site-packages/sagemaker/session.py\u001b[0m in \u001b[0;36mendpoint_from_production_variants\u001b[0;34m(self, name, production_variants, tags, kms_key, wait)\u001b[0m\n\u001b[1;32m   1077\u001b[0m \u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m   1078\u001b[0m             \u001b[0mself\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0msagemaker_client\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mcreate_endpoint_config\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;34m**\u001b[0m\u001b[0mconfig_options\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0;32m-> 1079\u001b[0;31m         \u001b[0;32mreturn\u001b[0m \u001b[0mself\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mcreate_endpoint\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mendpoint_name\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0mname\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mconfig_name\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0mname\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mtags\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0mtags\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mwait\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0mwait\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m   1080\u001b[0m \u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m   1081\u001b[0m     \u001b[0;32mdef\u001b[0m \u001b[0mexpand_role\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mself\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mrole\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;32m~/anaconda3/envs/python3/lib/python3.6/site-packages/sagemaker/session.py\u001b[0m in \u001b[0;36mcreate_endpoint\u001b[0;34m(self, endpoint_name, config_name, tags, wait)\u001b[0m\n\u001b[1;32m    785\u001b[0m         \u001b[0mtags\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mtags\u001b[0m \u001b[0;32mor\u001b[0m \u001b[0;34m[\u001b[0m\u001b[0;34m]\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    786\u001b[0m \u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0;32m--> 787\u001b[0;31m         \u001b[0mself\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0msagemaker_client\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mcreate_endpoint\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mEndpointName\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0mendpoint_name\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mEndpointConfigName\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0mconfig_name\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mTags\u001b[0m\u001b[0;34m=\u001b[0m\u001b[0mtags\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m    788\u001b[0m         \u001b[0;32mif\u001b[0m \u001b[0mwait\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    789\u001b[0m             \u001b[0mself\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mwait_for_endpoint\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mendpoint_name\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;32m~/anaconda3/envs/python3/lib/python3.6/site-packages/botocore/client.py\u001b[0m in \u001b[0;36m_api_call\u001b[0;34m(self, *args, **kwargs)\u001b[0m\n\u001b[1;32m    355\u001b[0m                     \"%s() only accepts keyword arguments.\" % py_operation_name)\n\u001b[1;32m    356\u001b[0m             \u001b[0;31m# The \"self\" in this scope is referring to the BaseClient.\u001b[0m\u001b[0;34m\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0;32m--> 357\u001b[0;31m             \u001b[0;32mreturn\u001b[0m \u001b[0mself\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0m_make_api_call\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0moperation_name\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0mkwargs\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m    358\u001b[0m \u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    359\u001b[0m         \u001b[0m_api_call\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0m__name__\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mstr\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mpy_operation_name\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;32m~/anaconda3/envs/python3/lib/python3.6/site-packages/botocore/client.py\u001b[0m in \u001b[0;36m_make_api_call\u001b[0;34m(self, operation_name, api_params)\u001b[0m\n\u001b[1;32m    659\u001b[0m             \u001b[0merror_code\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mparsed_response\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mget\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;34m\"Error\"\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0;34m{\u001b[0m\u001b[0;34m}\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mget\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0;34m\"Code\"\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    660\u001b[0m             \u001b[0merror_class\u001b[0m \u001b[0;34m=\u001b[0m \u001b[0mself\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mexceptions\u001b[0m\u001b[0;34m.\u001b[0m\u001b[0mfrom_code\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0merror_code\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0;32m--> 661\u001b[0;31m             \u001b[0;32mraise\u001b[0m \u001b[0merror_class\u001b[0m\u001b[0;34m(\u001b[0m\u001b[0mparsed_response\u001b[0m\u001b[0;34m,\u001b[0m \u001b[0moperation_name\u001b[0m\u001b[0;34m)\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[0m\u001b[1;32m    662\u001b[0m         \u001b[0;32melse\u001b[0m\u001b[0;34m:\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n\u001b[1;32m    663\u001b[0m             \u001b[0;32mreturn\u001b[0m \u001b[0mparsed_response\u001b[0m\u001b[0;34m\u001b[0m\u001b[0m\n",
+      "\u001b[0;31mResourceLimitExceeded\u001b[0m: An error occurred (ResourceLimitExceeded) when calling the CreateEndpoint operation: The account-level service limit 'ml.m4.xlarge for endpoint usage' is 0 Instances, with current utilization of 0 Instances and a request delta of 1 Instances. Please contact AWS support to request an increase for this limit."
+     ]
+    }
+   ],
+   "source": [
+    "xgb_predictor = xgb.deploy(initial_instance_count=1,instance_type='ml.m4.xlarge')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "##### Predicting the Queue Time"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "test_data_array = test_data.drop(['QUEUED_WAIT_SECONDS'], axis=1).as_matrix()\n",
+    "xgb_predictor.content_type = 'text/csv'\n",
+    "xgb_predictor.serializer = csv_serializer\n",
+    "predictions = xgb_predictor.predict(test_data_array).decode('utf-8')\n",
+    "predictions_array = np.fromstring(predictions[1:], sep=',')\n",
+    "print(predictions_array.shape)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "##### Evaluate Model Performance"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "cm = pd.crosstab(index=test_data['QUEUED_WAIT_SECONDS'], columns=np.round(predictions_array), rownames=['Observed'], colnames=['Predicted'])\n",
+    "tn = cm.iloc[0,0]; fn = cm.iloc[1,0]; tp = cm.iloc[1,1]; fp = cm.iloc[0,1]; p = (tp+tn)/(tp+tn+fp+fn)*100\n",
+    "print(\"\\n{0:<20}{1:<4.1f}%\\n\".format(\"Overall Classification Rate: \", p))\n",
+    "print(\"{0:<15}{1:<15}{2:>8}\".format(\"Predicted\", \"No Purchase\", \"Purchase\"))\n",
+    "print(\"Observed\")\n",
+    "print(\"{0:<15}{1:<2.0f}% ({2:<}){3:>6.0f}% ({4:<})\".format(\"No Purchase\", tn/(tn+fn)*100,tn, fp/(tp+fp)*100, fp))\n",
+    "print(\"{0:<16}{1:<1.0f}% ({2:<}){3:>7.0f}% ({4:<}) \\n\".format(\"Purchase\", fn/(tn+fn)*100,fn, tp/(tp+fp)*100, tp))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "##### Terminate Resources"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Terminating resources that are not actively being used reduces costs and is good practice. This deletes the Sagemaker endpoint."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "sagemaker.Session().delete_endpoint(xgb_predictor.endpoint)\n",
+    "bucket_to_delete = boto3.resource('s3').Bucket(bucket_name)\n",
+    "bucket_to_delete.objects.all().delete()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### KFold Prediction"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Cross-validation is a resampling procedure used to evaluate machine learning models on a data sample. It is simple to understand and it generally results in a less biased estimate of the model skill than a simple train/test split. The procedure has a single parameter called k that refers to the number of groups that a given data sample is to be split into. After splitting the dataset into k folds, the first fold is used to test the model and the rest are used to train the model. In the second iteration, the second fold is used as the testing set while the rest serve as the training set. This process is repeated until each of the k folds have been used as the testing set. With the data, you must determine what (float or int) features heavily impact the dependent variable (queue time). I chose the run time, nodes requested, and nodes used."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "##### KFold (First 100 lines)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "In order to see if the KFold procedure was splitting the data into testing and training sets accurately, I tested the method on a small section of the data, the first 100 lines only. From this process, I was able to see that the data was being split up accurately and how the number of splits affected the overall accuracy of the model (in terms of r squared). It seems as though the r squared value was the highest at 25 splits, with the r squared being -.63."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 28,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Train Index:  [ 4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27\n",
+      " 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51\n",
+      " 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75\n",
+      " 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98] \n",
+      "\n",
+      "Test Index:  [0 1 2 3]\n",
+      "Train Index:  [ 0  1  2  3  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27\n",
+      " 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51\n",
+      " 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75\n",
+      " 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98] \n",
+      "\n",
+      "Test Index:  [4 5 6 7]\n",
+      "Train Index:  [ 0  1  2  3  4  5  6  7 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27\n",
+      " 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51\n",
+      " 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75\n",
+      " 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98] \n",
+      "\n",
+      "Test Index:  [ 8  9 10 11]\n",
+      "Train Index:  [ 0  1  2  3  4  5  6  7  8  9 10 11 16 17 18 19 20 21 22 23 24 25 26 27\n",
+      " 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51\n",
+      " 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75\n",
+      " 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98] \n",
+      "\n",
+      "Test Index:  [12 13 14 15]\n",
+      "Train Index:  [ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 20 21 22 23 24 25 26 27\n",
+      " 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51\n",
+      " 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75\n",
+      " 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98] \n",
+      "\n",
+      "Test Index:  [16 17 18 19]\n",
+      "Train Index:  [ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 24 25 26 27\n",
+      " 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51\n",
+      " 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75\n",
+      " 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98] \n",
+      "\n",
+      "Test Index:  [20 21 22 23]\n",
+      "Train Index:  [ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23\n",
+      " 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51\n",
+      " 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75\n",
+      " 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98] \n",
+      "\n",
+      "Test Index:  [24 25 26 27]\n",
+      "Train Index:  [ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23\n",
+      " 24 25 26 27 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51\n",
+      " 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75\n",
+      " 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98] \n",
+      "\n",
+      "Test Index:  [28 29 30 31]\n",
+      "Train Index:  [ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23\n",
+      " 24 25 26 27 28 29 30 31 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51\n",
+      " 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75\n",
+      " 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98] \n",
+      "\n",
+      "Test Index:  [32 33 34 35]\n",
+      "Train Index:  [ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23\n",
+      " 24 25 26 27 28 29 30 31 32 33 34 35 40 41 42 43 44 45 46 47 48 49 50 51\n",
+      " 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75\n",
+      " 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98] \n",
+      "\n",
+      "Test Index:  [36 37 38 39]\n",
+      "Train Index:  [ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23\n",
+      " 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 44 45 46 47 48 49 50 51\n",
+      " 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75\n",
+      " 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98] \n",
+      "\n",
+      "Test Index:  [40 41 42 43]\n",
+      "Train Index:  [ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23\n",
+      " 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 48 49 50 51\n",
+      " 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75\n",
+      " 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98] \n",
+      "\n",
+      "Test Index:  [44 45 46 47]\n",
+      "Train Index:  [ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23\n",
+      " 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47\n",
+      " 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75\n",
+      " 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98] \n",
+      "\n",
+      "Test Index:  [48 49 50 51]\n",
+      "Train Index:  [ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23\n",
+      " 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47\n",
+      " 48 49 50 51 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75\n",
+      " 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98] \n",
+      "\n",
+      "Test Index:  [52 53 54 55]\n",
+      "Train Index:  [ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23\n",
+      " 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47\n",
+      " 48 49 50 51 52 53 54 55 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75\n",
+      " 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98] \n",
+      "\n",
+      "Test Index:  [56 57 58 59]\n",
+      "Train Index:  [ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23\n",
+      " 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47\n",
+      " 48 49 50 51 52 53 54 55 56 57 58 59 64 65 66 67 68 69 70 71 72 73 74 75\n",
+      " 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98] \n",
+      "\n",
+      "Test Index:  [60 61 62 63]\n",
+      "Train Index:  [ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23\n",
+      " 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47\n",
+      " 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 68 69 70 71 72 73 74 75\n",
+      " 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98] \n",
+      "\n",
+      "Test Index:  [64 65 66 67]\n",
+      "Train Index:  [ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23\n",
+      " 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47\n",
+      " 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 72 73 74 75\n",
+      " 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98] \n",
+      "\n",
+      "Test Index:  [68 69 70 71]\n",
+      "Train Index:  [ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23\n",
+      " 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47\n",
+      " 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71\n",
+      " 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98] \n",
+      "\n",
+      "Test Index:  [72 73 74 75]\n",
+      "Train Index:  [ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23\n",
+      " 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47\n",
+      " 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71\n",
+      " 72 73 74 75 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98] \n",
+      "\n",
+      "Test Index:  [76 77 78 79]\n",
+      "Train Index:  [ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23\n",
+      " 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47\n",
+      " 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71\n",
+      " 72 73 74 75 76 77 78 79 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98] \n",
+      "\n",
+      "Test Index:  [80 81 82 83]\n",
+      "Train Index:  [ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23\n",
+      " 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47\n",
+      " 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71\n",
+      " 72 73 74 75 76 77 78 79 80 81 82 83 88 89 90 91 92 93 94 95 96 97 98] \n",
+      "\n",
+      "Test Index:  [84 85 86 87]\n",
+      "Train Index:  [ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23\n",
+      " 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47\n",
+      " 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71\n",
+      " 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 92 93 94 95 96 97 98] \n",
+      "\n",
+      "Test Index:  [88 89 90 91]\n",
+      "Train Index:  [ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23\n",
+      " 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47\n",
+      " 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71\n",
+      " 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 96 97 98] \n",
+      "\n",
+      "Test Index:  [92 93 94 95]\n",
+      "Train Index:  [ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23\n",
+      " 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47\n",
+      " 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71\n",
+      " 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95] \n",
+      "\n",
+      "Test Index:  [96 97 98]\n"
+     ]
+    }
+   ],
+   "source": [
+    "model_data = pd.read_csv('./SECTION_ANL-ALCF-DJC-THETA_20190101_20190630.csv', header=0)\n",
+    "\n",
+    "x = model_data.iloc[:,[13,14,15]]\n",
+    "y = model_data.iloc[:,12]\n",
+    "scaler = MinMaxScaler(feature_range=(0, 1))\n",
+    "x = scaler.fit_transform(x)\n",
+    "\n",
+    "scores = []\n",
+    "best_svr = SVR(kernel='rbf', gamma = 'scale')\n",
+    "cv = KFold(n_splits=25, random_state=42, shuffle=False)\n",
+    "for train_index, test_index in cv.split(x):\n",
+    "    print(\"Train Index: \", train_index, \"\\n\")\n",
+    "    print(\"Test Index: \", test_index)\n",
+    "    x_train, x_test, y_train, y_test = x[train_index], x[test_index], y[train_index], y[test_index]\n",
+    "    best_svr.fit(x_train, y_train)\n",
+    "    scores.append(best_svr.score(x_test, y_test))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 29,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "-0.6275891208497313\n"
+     ]
+    }
+   ],
+   "source": [
+    "best_svr.fit(x_train, y_train)\n",
+    "scores.append(best_svr.score(x_test, y_test))\n",
+    "print(np.mean(scores)) #overall accuracy"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "##### KFold Prediction (All Data)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "While it is certain that this method works, it is much less accurate while running it on all of the data. This might be due to the fact that the number of splits chosen is not optimal, but also the difficulty in predicting the queue time with the given data."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "try:\n",
+    "  model_data = pd.read_csv('./ANL-ALCF-DJC-THETA_20190101_20190630.csv', header=0)\n",
+    "  print('Success: Data loaded into dataframe.')\n",
+    "except Exception as e:\n",
+    "    print('Data load error: ',e)\n",
+    "x = model_data.iloc[:,[13,14,15]]\n",
+    "y = model_data.iloc[:,12]\n",
+    "scaler = MinMaxScaler(feature_range=(0, 1))\n",
+    "x = scaler.fit_transform(x)\n",
+    "\n",
+    "scores = []\n",
+    "best_svr = SVR(kernel='rbf', gamma='scale')\n",
+    "cv = KFold(n_splits=50, random_state=42, shuffle=False)\n",
+    "for train_index, test_index in cv.split(x):\n",
+    "    print(\"Train Index: \", train_index, \"\\n\")\n",
+    "    print(\"Test Index: \", test_index)\n",
+    "    x_train, x_test, y_train, y_test = x[train_index], x[test_index], y[train_index], y[test_index]\n",
+    "    best_svr.fit(x_train, y_train)\n",
+    "    scores.append(best_svr.score(x_test, y_test))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "best_svr.fit(x_train, y_train)\n",
+    "scores.append(best_svr.score(x_test, y_test))\n",
+    "print(np.mean(scores)) #overall accuracy"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {
+    "scrolled": false
+   },
+   "outputs": [],
+   "source": [
+    "cross_val_score(best_svr, x, y, cv=50) #list of r^2 scores"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "cross_val_predict(best_svr, x, y, cv=50) #list of predictions"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "conda_python3",
+   "language": "python",
+   "name": "conda_python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.6.5"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 2
+}
